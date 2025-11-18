@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "studyglance-backend"
+version = "0.1.0"
+description = "StudyGlance backend API"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["app"]
+testpaths = ["app/tests", "tests"]

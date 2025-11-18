@@ -1,0 +1,5 @@
+[
+  {"ts_ms": 1710000000000, "bbox": [10, 10, 120, 40], "text": "Intro: StudyGlance overview"},
+  {"ts_ms": 1710000002000, "bbox": [22, 80, 180, 60], "text": "API rate limit: 100 rpm"},
+  {"ts_ms": 1710000004000, "bbox": [40, 120, 220, 80], "text": "Privacy: frames never stored"}
+]
