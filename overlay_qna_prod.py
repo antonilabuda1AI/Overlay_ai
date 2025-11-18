@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Overlay Q&A - Top bar with Live OCR and RAG (FAISS + OpenAI)
 
@@ -140,6 +140,14 @@ def save_user_settings():
 # Set tesseract path if present
 if TESSERACT_CMD and os.path.exists(TESSERACT_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+def tesseract_ok() -> bool:
+    try:
+        _ = pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
 
 
 # ---------- OCR & screen helpers ----------
@@ -474,6 +482,37 @@ def _sg_local_embed(texts: List[str], dim: int) -> np.ndarray:
     return np.vstack(out) if out else np.zeros((0, dim), dtype="float32")
 
 
+
+# Strengthened prompt to avoid disclaimers about not seeing the screen
+
+def sanitize_llm_answer(ans: str) -> str:
+    try:
+        lines = ans.splitlines()
+        out = []
+        skip = [
+            "i can't see your screen",
+            "i cannot see your screen",
+            "i don't have access to your screen",
+            "i dont have access to your screen",
+            "i don't have the ability to view your screen",
+            "i cant see your screen",
+            "as an ai",
+            "i can't view images",
+            "i cannot view images",
+            "i can't view your screen",
+            "i cannot view your screen",
+        ]
+        for line in lines:
+            lo = line.strip().lower()
+            if any(ph in lo for ph in skip):
+                continue
+            out.append(line)
+        cleaned = "\n".join(out).strip()
+        for ph in skip:
+            cleaned = cleaned.replace(ph, "based on the OCR context")
+        return cleaned or ans
+    except Exception:
+        return ans
 def call_llm(question: str, context_blob: str) -> str:
     """Chat call with graceful fallback if key/model unavailable."""
     if not OPENAI_API_KEY or OpenAI is None:
@@ -482,17 +521,21 @@ def call_llm(question: str, context_blob: str) -> str:
         return ("(offline mode) " + question + "\n" + "\n".join(ctx_lines))[:1200]
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
+        sys_prompt = (
+            "You are a helpful assistant. You are given OCR text captured from the user's screen as 'Context (OCR)'. "
+            "Treat it as if you can see their screen. Do NOT say 'I cannot see your screen'. "
+            "Use only the provided context to reason and answer in English. "
+            "If the context is insufficient, ask a clarifying question rather than claiming you cannot see the screen."
+        )
         msgs = [
-            {"role": "system", "content": "You are a helpful assistant. Always answer in English."},
+            {"role": "system", "content": sys_prompt},
             {"role": "user",   "content": f"Context (OCR):\n{context_blob}\n\nQuestion: {question}"},
         ]
         r = client.chat.completions.create(model=OPENAI_MODEL_CHAT, messages=msgs, temperature=0.2)
-        return (r.choices[0].message.content or "").strip()
+        content = (r.choices[0].message.content or "").strip()
+        return sanitize_llm_answer(content)
     except Exception as e:
         return f"LLM call error: {e}"
-
-
-# ---------- UI ----------
 class AnswerBubble(QtWidgets.QWidget):
     """Dark, draggable answer bubble below the top bar. Stays until closed."""
 
@@ -516,11 +559,12 @@ class AnswerBubble(QtWidgets.QWidget):
         self.text.setMinimumHeight(80)
         self.text.setMaximumHeight(260)
         v.addWidget(self.text)
-
+        # Close button in top-right of bubble
         self.closeBtn = QtWidgets.QPushButton("X", self)
-        self.closeBtn.setStyleSheet("QPushButton { color:white; background:transparent; border:none; font-weight:bold; }")
         self.closeBtn.setToolTip("Close answer")
+        self.closeBtn.setStyleSheet("QPushButton { color:white; background:transparent; border:none; font-weight:bold; }")
         self.closeBtn.clicked.connect(self.fade_out_and_hide)
+
 
         self.resize(640, 160)
         self.box.setGeometry(0, 0, self.width(), self.height())
@@ -534,8 +578,6 @@ class AnswerBubble(QtWidgets.QWidget):
 
         self.hide()
 
-    def _place_close_btn(self):
-        self.closeBtn.move(self.width() - 28, 6)
 
     def show_answer(self, s: str, duration_ms: int = 0):
         # Ensure no stale auto-hide connection remains and show instantly (no auto-hide)
@@ -554,13 +596,18 @@ class AnswerBubble(QtWidgets.QWidget):
                 y = parent.height() + 8
                 self.move(max(8, x), y)
         self.text.setHtml(s.replace("\n", "<br>"))
-        self._place_close_btn()
         try:
             self._eff.setOpacity(1.0)
         except Exception:
             pass
         self.show()
         self.raise_()
+
+    def _place_close_btn(self):
+        try:
+            self.closeBtn.move(self.width() - 28, 6)
+        except Exception:
+            pass
 
     def fade_out_and_hide(self):
         self._anim.stop()
@@ -602,32 +649,196 @@ class AnswerBubble(QtWidgets.QWidget):
         self._place_close_btn()
 
 
-class HistoryWindow(QtWidgets.QWidget):
-    """Lightweight history window - toggle + save to file."""
+class MessageBubble(QtWidgets.QFrame):
+    def __init__(self, role: str, html: str, timestamp: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName('MsgBubble')
+        # Base style; role-specific backgrounds applied below
+        self.setStyleSheet(
+            "QFrame#MsgBubble { border-radius: 18px; }\n"
+            "QTextBrowser { border:none; background:transparent; margin:0px; padding:0px;" \
+            " font-family:'Segoe UI', Inter, Roboto, Arial, 'Helvetica Neue', sans-serif; font-size:13px; line-height:1.35; color:#FFFFFF; }\n"
+            "QTextBrowser:hover { background:transparent; }"
+        )
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 8)
+        lay.setSpacing(6)
 
+        # Subtle drop shadow for depth
+        _shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        _shadow.setBlurRadius(18)
+        _shadow.setColor(QtGui.QColor(0, 0, 0, 76))
+        _shadow.setOffset(0, 2)
+        self.setGraphicsEffect(_shadow)
+
+        self.browser = QtWidgets.QTextBrowser(self)
+        self.browser.setOpenExternalLinks(True)
+        self.browser.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.browser.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.browser.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.browser.setLineWrapMode(QtWidgets.QTextEdit.LineWrapMode.WidgetWidth)
+        self.browser.setWordWrapMode(QtGui.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.browser.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse |
+            QtCore.Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        self.browser.setHtml(html)
+        try:
+            _doc = self.browser.document()
+            _doc.setTextWidth(max(100.0, float(self.maximumWidth() - 32)))
+            _h = int(_doc.size().height()) + 4
+            self.browser.setMinimumHeight(_h)
+            self.browser.setMaximumHeight(_h)
+        except Exception:
+            pass
+        lay.addWidget(self.browser)
+
+        self.ts = QtWidgets.QLabel(timestamp, self)
+        f = self.ts.font(); f.setPointSize(10); self.ts.setFont(f)
+        self.ts.setStyleSheet("color:#CCCCCC; margin-top:3px;")
+        lay.addWidget(self.ts, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+
+        # Role-specific background colors
+        if role == 'user':
+            self.setStyleSheet(self.styleSheet() + "QFrame#MsgBubble{ background:#1877F2; }")
+        else:
+            self.setStyleSheet(self.styleSheet() + "QFrame#MsgBubble{ background:#2B2B2B; }")
+
+    def set_max_width(self, w: int):
+        """Set maximum width and auto-fit the inner browser height to its content.
+        Keeps bubbles compact with no internal scrollbars.
+        """
+        try:
+            self.setMaximumWidth(w)
+            doc = self.browser.document()
+            doc.setTextWidth(max(50.0, float(w - 32)))
+            h = int(doc.size().height()) + 4
+            self.browser.setMinimumHeight(h)
+            self.browser.setMaximumHeight(h)
+        except Exception:
+            pass
+
+
+class HistoryWindow(QtWidgets.QWidget):
+    """Modern chat-like history with aligned message bubbles and manual save only."""
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Answer History")
         self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
-        self.resize(720, 540)
-        v = QtWidgets.QVBoxLayout(self)
-        self.out = QtWidgets.QTextEdit(readOnly=True)
-        v.addWidget(self.out)
-
-        btns = QtWidgets.QHBoxLayout()
-        self.btnSave = QtWidgets.QPushButton("Save...")
-        btns.addStretch(1)
-        btns.addWidget(self.btnSave)
-        v.addLayout(btns)
-
-        self.btnSave.clicked.connect(self.save_dialog)
+        self.resize(860, 640)
         self._plain_log: List[str] = []
+        self._bubbles: list[MessageBubble] = []
+
+        # Overall dark theme background
+        self.setStyleSheet(
+            "QWidget { background:#1E1E1E; color:#EAEAEA; }\n"
+            "QScrollArea { border:none; background:#1E1E1E; }\n"
+        )
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(16, 14, 16, 16)
+        outer.setSpacing(10)
+
+        head = QtWidgets.QHBoxLayout(); outer.addLayout(head)
+        title = QtWidgets.QLabel("History")
+        tf = title.font(); tf.setPointSize(11); tf.setBold(True); title.setFont(tf)
+        head.addWidget(title); head.addStretch(1)
+        self.btnSave = QtWidgets.QPushButton("Save...")
+        self.btnSave.setStyleSheet("QPushButton{background:#1f2430; color:#EAEAEA; border:1px solid #2a2f3a; border-radius:8px; padding:6px 12px;} QPushButton:hover{background:#293142;}")
+        self.btnSave.clicked.connect(self.save_dialog)
+        head.addWidget(self.btnSave)
+
+        self.scroll = QtWidgets.QScrollArea(self); self.scroll.setWidgetResizable(True)
+        outer.addWidget(self.scroll, 1)
+        self._host = QtWidgets.QWidget()
+        self._list = QtWidgets.QVBoxLayout(self._host)
+        self._list.setContentsMargins(12, 12, 12, 12)
+        self._list.setSpacing(10)
+        self._list.addStretch(1)
+        self.scroll.setWidget(self._host)
+        # small spacing under header
+        outer.addSpacing(8)
+
+    def _format_html(self, text: str) -> str:
+        # Escape text and render simple markdown-like parts and ``` code blocks
+        def esc(s: str) -> str:
+            return (s.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;'))
+        t = text.replace('\r','')
+        blocks = t.split('```')
+        out: list[str] = []
+        for i, b in enumerate(blocks):
+            if i % 2 == 1:
+                out.append(f"<pre style=\"background:#0F0F12;border:1px solid #202026;border-radius:12px;padding:8px;\"><code style=\"font-family:Consolas,'Courier New',monospace;font-size:12px;\">{esc(b)}</code></pre>")
+            else:
+                lines = b.split('\n')
+                ul = False
+                for line in lines:
+                    ls = line.strip()
+                    if ls.startswith(('#','##','###')):
+                        lvl = len(ls) - len(ls.lstrip('#'))
+                        txt = esc(ls.lstrip('#').strip())
+                        size = 16 if lvl==1 else 14 if lvl==2 else 13
+                        out.append(f"<div style=\"font-weight:600;font-size:{size}px;margin:6px 0;\">{txt}</div>")
+                    elif ls.startswith(('- ','* ')):
+                        if not ul:
+                            out.append('<ul style="margin:4px 16px;">'); ul = True
+                        out.append(f"<li style=\"margin:2px 0;\">{esc(ls[2:])}</li>")
+                    else:
+                        if ul:
+                            out.append('</ul>'); ul=False
+                        if ls:
+                            out.append(f"<div style=\"line-height:1.35;\">{esc(line)}</div>")
+                        else:
+                            out.append('<div style="height:6px;"></div>')
+                if ul:
+                    out.append('</ul>')
+        return "\n".join(out)
+
+    def _max_bubble_width(self) -> int:
+        vw = self.scroll.viewport().width() if self.scroll and self.scroll.viewport() else self.width()
+        return int(max(320, vw * 0.55))
+    def resizeEvent(self, e: QtGui.QResizeEvent):
+        super().resizeEvent(e)
+        mw = self._max_bubble_width()
+        for b in self._bubbles:
+            try:
+                b.set_max_width(mw)
+            except Exception:
+                b.setMaximumWidth(mw)
+
+    def _add_bubble(self, role: str, text: str):
+        wrap = QtWidgets.QWidget(self._host)
+        row = QtWidgets.QHBoxLayout(wrap); row.setContentsMargins(6,6,6,6); row.setSpacing(6)
+        ts = datetime.datetime.now().strftime('%H:%M')
+        html = self._format_html(text)
+        bubble = MessageBubble(role, html, ts, parent=wrap)
+        bubble.set_max_width(self._max_bubble_width())
+        if role == 'user':
+            row.addStretch(1); row.addWidget(bubble)
+        else:
+            row.addWidget(bubble); row.addStretch(1)
+        idx = self._list.count()-1
+        self._list.insertWidget(idx, wrap)
+        self._bubbles.append(bubble)
+        # Autoscroll to bottom
+        QtCore.QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
+        # Plain text log
+        self._plain_log.append(text)
+
+    @QtCore.pyqtSlot(str)
+    def append_user(self, text: str):
+        self._add_bubble('user', text)
+
+    @QtCore.pyqtSlot(str)
+    def append_ai(self, text: str):
+        self._add_bubble('ai', text)
 
     def append_html(self, html: str):
-        self.out.append(html)
-        t = QtGui.QTextDocument()
-        t.setHtml(html)
-        self._plain_log.append(t.toPlainText())
+        # Compatibility: coerce incoming HTML to readable text then render as AI bubble
+        try:
+            txt = QtGui.QTextDocumentFragment.fromHtml(html).toPlainText()
+        except Exception:
+            txt = html
+        self._add_bubble('ai', txt)
 
     def toggle(self):
         if self.isVisible():
@@ -637,8 +848,7 @@ class HistoryWindow(QtWidgets.QWidget):
 
     def save_dialog(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save history", os.path.join("C:\\ai", "history.txt"), "Text Files (*.txt);;All Files (*)"
-        )
+            self, "Save history", os.path.join("C:\\ai", "history.txt"), "Text Files (*.txt);;All Files (*)")
         if path:
             try:
                 with open(path, "w", encoding="utf-8") as f:
@@ -647,21 +857,18 @@ class HistoryWindow(QtWidgets.QWidget):
                 QtWidgets.QMessageBox.warning(self, "Save error", str(e))
 
     def auto_export_on_quit(self):
-        # Optional autosave on quit
-        try:
-            os.makedirs("C:\\ai", exist_ok=True)
-            ts = datetime.datetime.now().strftime("%Y%m%d-%H%M")
-            path = os.path.join("C:\\ai", f"history-{ts}.txt")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("\n\n".join(self._plain_log))
-            print(f"[History] Saved: {path}")
-        except Exception as e:
-            print(f"[History] Autosave error: {e}", file=sys.stderr)
+        # Disabled: manual save only
+        return
 
     def clear_all(self):
         try:
-            self.out.clear()
+            while self._list.count() > 1:
+                itm = self._list.takeAt(0)
+                w = itm.widget()
+                if w is not None:
+                    w.setParent(None)
             self._plain_log = []
+            self._bubbles = []
         except Exception:
             pass
 
@@ -723,8 +930,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cmb_capture.setCurrentText(CAPTURE_MODE)
         if CAPTURE_CUSTOM_BBOX and CAPTURE_CUSTOM_BBOX.get("width",0)>0:
             self.inp_bbox.setText(
-                f"{CAPTURE_CUSTOM_BBOX['left']},{CAPTURE_CUSTOM_BBOX['top']},{CAPTURE_CUSTOM_BBOX['width']},{CAPTURE_CUSTOM_BBOX['height']}"
-            )
+                f"{CAPTURE_CUSTOM_BBOX['left']},{CAPTURE_CUSTOM_BBOX['top']},{CAPTURE_CUSTOM_BBOX['width']},{CAPTURE_CUSTOM_BBOX['height']}")
 
     def _collect(self) -> dict:
         bbox = {"left":0,"top":0,"width":0,"height":0}
@@ -786,7 +992,9 @@ class TopBar(QtWidgets.QWidget):
             "QPushButton:hover { background: rgba(255,255,255,60);} "
             "QLabel { color: #ddd; }"
         )
-        h = QtWidgets.QHBoxLayout(box); h.setContentsMargins(12,8,12,8); h.setSpacing(8)
+        h = QtWidgets.QHBoxLayout(box)
+        h.setContentsMargins(12,8,12,8)
+        h.setSpacing(8)
 
         self.handle = QtWidgets.QLabel(":::")
         self.inp = QtWidgets.QLineEdit(); self.inp.setPlaceholderText("Ask a question...")
@@ -795,17 +1003,34 @@ class TopBar(QtWidgets.QWidget):
         self.btnHist = QtWidgets.QPushButton("History")
         self.btnSettings = QtWidgets.QPushButton("Settings")
         self.btnAsk  = QtWidgets.QPushButton("Send")
-        self.btnClose= QtWidgets.QPushButton("X"); self.btnClose.setToolTip("Close"); self.btnClose.setFixedWidth(30)
+        self.btnClose= QtWidgets.QPushButton("X")
+        self.btnClose.setToolTip("Close")
+        self.btnClose.setFixedWidth(30)
         self.btnClose.setStyleSheet(
             "QPushButton { background: rgba(255,255,255,40); border-radius: 10px; color: white; font-weight: bold; } "
             "QPushButton:hover { background: rgba(255,80,80,80); }"
         )
+        try: self.btnClose.setAutoDefault(False)
+        except Exception: pass
+        try: self.btnClose.setDefault(False)
+        except Exception: pass
+        try:
+            self.btnAsk.setAutoDefault(True)
+            self.btnAsk.setDefault(True)
+        except Exception:
+            pass
 
-        h.addWidget(self.handle); h.addWidget(self.inp, 1)
-        h.addWidget(self.btnLive); h.addWidget(self.btnEco); h.addWidget(self.btnHist); h.addWidget(self.btnSettings)
-        h.addWidget(self.btnAsk); h.addWidget(self.btnClose)
+        h.addWidget(self.handle)
+        h.addWidget(self.inp, 1)
+        h.addWidget(self.btnLive)
+        h.addWidget(self.btnEco)
+        h.addWidget(self.btnHist)
+        h.addWidget(self.btnSettings)
+        h.addWidget(self.btnAsk)
+        h.addWidget(self.btnClose)
 
-        box.setGeometry(0,0,TOPBAR_WIDTH,TOPBAR_HEIGHT); self.setFixedWidth(TOPBAR_WIDTH)
+        box.setGeometry(0,0,TOPBAR_WIDTH,TOPBAR_HEIGHT)
+        self.setFixedWidth(TOPBAR_WIDTH)
 
         scr = QtGui.QGuiApplication.primaryScreen().availableGeometry()
         self.move(scr.center().x() - self.width()//2, scr.top() + 6)
@@ -916,8 +1141,8 @@ class Toast(QtWidgets.QWidget):
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.Tool |
             Qt.WindowType.WindowStaysOnTopHint
-        )
         # Use window opacity for translucency (more reliable in packaged EXE)
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setWindowOpacity(0.92)
@@ -1114,7 +1339,6 @@ class OcrWorker(QtCore.QObject):
     def stop(self):
         self._stop = True
 
-
 class Core(QtCore.QObject):
     toastSignal = QtCore.pyqtSignal(str)
     showAnswerSignal = QtCore.pyqtSignal(str)
@@ -1126,12 +1350,16 @@ class Core(QtCore.QObject):
         self.bubble = bubble
         self.hist = hist
         self._worker: Optional[OcrWorker] = None
+        self._capture_allowed = False
+        self._silence_refresh_once = False
 
         # Global keyboard shortcut for Settings (Ctrl+,)
         self._settings = None
         self._scSettings = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+,"), self.bar)
-        try: self._scSettings.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        except Exception: pass
+        try:
+            self._scSettings.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        except Exception:
+            pass
         self._scSettings.activated.connect(self.show_settings)
 
         # Manual reset hotkey (Ctrl+R)
@@ -1149,24 +1377,91 @@ class Core(QtCore.QObject):
         CTX.add(txt)
 
     def ask(self, q: str):
-        docs = CTX.retrieve(q, top_n=CONTEXT_TOP_K)
-        if not docs:
-            msg = "No context. Turn on Live OCR (Ctrl+L), make sure text is visible on screen, then ask again."
-            html = f"<b>Answer:</b><br>{msg}"
+        try:
+            if not tesseract_ok():
+                try: self.toastSignal.emit("Tesseract not found. Install Tesseract or set TESSERACT_CMD.")
+                except Exception: pass
+            
+            # One-shot seed from screen regardless of live state (diagnostic toasts)
+            try:
+                bbox = capture_screen_bbox_of_widget(self.bar)
+                with mss() as _sct:
+                    shot = _sct.grab(bbox)
+                pil = pil_from_mss_shot(shot)
+                pil = _blackout_bar_in_pil(pil, bbox, self.bar)
+                txt = ocr_image(pil)
+                if txt:
+                    CTX.add(txt)
+                    try: self.toastSignal.emit(f"Seeded context ({len(txt)} chars)")
+                    except Exception: pass
+                else:
+                    try: self.toastSignal.emit("Seed capture found no text")
+                    except Exception: pass
+            except Exception as e:
+                try: self.toastSignal.emit(f"Seed OCR error: {e}")
+                except Exception: pass
+            # Seed capture (debug): save images and OCR without blackout
+            try:
+                bbox = capture_screen_bbox_of_widget(self.bar)
+                with mss() as _sct:
+                    shot = _sct.grab(bbox)
+                pil = pil_from_mss_shot(shot)
+                try:
+                    pil.save(r"C:\overlay_ai\debug_seed.png")
+                except Exception:
+                    pass
+                prep = preprocess_for_ocr(pil)
+                try:
+                    prep.save(r"C:\overlay_ai\debug_seed_pre.png")
+                except Exception:
+                    pass
+                txt_dbg = ocr_image(pil)
+                if txt_dbg:
+                    CTX.add(txt_dbg)
+                    try: self.toastSignal.emit(f"Seeded context ({len(txt_dbg)} chars)")
+                    except Exception: pass
+                else:
+                    try: self.toastSignal.emit("Seed capture found no text")
+                    except Exception: pass
+            except Exception as e:
+                try: self.toastSignal.emit(f"Seed OCR error: {e}")
+                except Exception: pass
+            docs = CTX.retrieve(q, top_n=CONTEXT_TOP_K)
+            if not docs:
+                msg = "No context. Turn on Live OCR (Ctrl+L), make sure text is visible on screen, then ask again."
+                html = f"<b>Answer:</b><br>{msg}"
+                self.showAnswerSignal.emit(html)
+                self.toastSignal.emit("No context - turn on Live OCR")
+                try:
+                    self.hist.append_user(q)
+                    self.hist.append_ai(msg)
+                except Exception:
+                    self.historySignal.emit(f"<b>You:</b> {q}<br>{html}<hr>")
+                return
+            ctx_blob = "\n\n---\n".join(d.text for d in docs)
+            ans = call_llm(q, ctx_blob) or "(no answer)"
+            safe = ans.replace("<","&lt;").replace(">","&gt;")
+            html = f"<b>Answer:</b><br>{safe}"
             self.showAnswerSignal.emit(html)
-            self.toastSignal.emit("No context - turn on Live OCR")
-            self.historySignal.emit(f"<b>You:</b> {q}<br>{html}<hr>")
+            self.toastSignal.emit("Answer ready")
+            try:
+                self.hist.append_user(q)
+                self.hist.append_ai(ans)
+            except Exception:
+                self.historySignal.emit(f"<b>You:</b> {q}<br>{html}<hr>")
             return
-        ctx_blob = "\n\n---\n".join(d.text for d in docs)
-        ans = call_llm(q, ctx_blob) or "(no answer)"
-        safe = ans.replace("<","&lt;").replace(">","&gt;")
-        html = f"<b>Answer:</b><br>{safe}"
-        self.showAnswerSignal.emit(html)
-        self.toastSignal.emit("Answer ready")
-        self.historySignal.emit(f"<b>You:</b> {q}<br>{html}<hr>")
-
+        except Exception as e:
+            try:
+                self.toastSignal.emit(f"Error: {e}")
+            except Exception:
+                pass
+            try:
+                self.hist.append_ai(f"Error: {e}")
+            except Exception:
+                pass
+            return
     @QtCore.pyqtSlot()
-    def reset_all(self):
+    def reset_all(self, silent: bool = False):
         # Soft reset: clear OCR/RAG context, keep history window entries
         if self._worker is not None:
             try:
@@ -1177,15 +1472,20 @@ class Core(QtCore.QObject):
             CTX.reset()
         except Exception:
             pass
-        self.toastSignal.emit("Context reset")
+        if not silent:
+            self.toastSignal.emit("Context reset")
+        else:
+            self._silence_refresh_once = True
         if self._reset_timer is None:
             self._reset_timer = QtCore.QTimer(self)
             self._reset_timer.setSingleShot(True)
             self._reset_timer.timeout.connect(self._seed_context_from_screen)
-        self._reset_timer.start(400)
-
+        if self._capture_allowed:
+            self._reset_timer.start(400)
     @QtCore.pyqtSlot()
     def _seed_context_from_screen(self):
+        if not self._capture_allowed:
+            return
         try:
             bbox = capture_screen_bbox_of_widget(self.bar)
             with mss() as _sct:
@@ -1193,15 +1493,27 @@ class Core(QtCore.QObject):
             pil = pil_from_mss_shot(shot)
             pil = _blackout_bar_in_pil(pil, bbox, self.bar)
             txt = ocr_image(pil)
+            if not txt:
+                # Fallback: full-screen capture
+                try:
+                    with mss() as _sct:
+                        mon = _sct.monitors[0]
+                        shot_fs = _sct.grab(mon)
+                    pil_fs = pil_from_mss_shot(shot_fs)
+                    txt = ocr_image(pil_fs)
+                except Exception:
+                    txt = ""
             if txt:
                 CTX.add(txt)
-                self.toastSignal.emit("Context refreshed")
+                if not self._silence_refresh_once:
+                    self.toastSignal.emit("Context refreshed")
+                else:
+                    self._silence_refresh_once = False
         except Exception:
             pass
-
     @QtCore.pyqtSlot(tuple)
     def on_window_changed(self, _sig: tuple):
-        self.reset_all()
+        self.reset_all(True)
 
     def show_settings(self):
         # Modal dialog without changing top bar design
@@ -1242,6 +1554,23 @@ class Core(QtCore.QObject):
         except Exception:
             pass
 
+    @QtCore.pyqtSlot(bool)
+    def on_live_toggled(self, on: bool):
+        self._capture_allowed = bool(on)
+        if on:
+            # Prime context immediately when Live turns ON
+            self.reset_all(True)
+# Global exception hook for diagnostics
+import traceback
+
+def excepthook(exc_type, exc, tb):
+    try:
+        print("[Unhandled]", exc)
+        traceback.print_exception(exc_type, exc, tb)
+    except Exception:
+        pass
+
+sys.excepthook = excepthook
 
 # ------------------- MAIN --------------------
 def main():
@@ -1268,7 +1597,7 @@ def main():
     thread.started.connect(worker.run)
 
     # GUI -> worker
-    bar.liveToggleSignal.connect(worker.set_live)
+    bar.liveToggleSignal.connect(worker.set_live); bar.liveToggleSignal.connect(core.on_live_toggled)
     bar.ecoToggleSignal.connect(worker.set_eco)
 
     # worker -> Core/GUI
@@ -1319,7 +1648,6 @@ def main():
     bar.ecoToggleSignal.connect(lambda s: (print("[UI] Eco toggled:", s), show_toast(f"Eco: {'ON' if s else 'OFF'}")))
 
     # cleanup
-    app.aboutToQuit.connect(hist.auto_export_on_quit)
     app.aboutToQuit.connect(worker.stop)
     app.aboutToQuit.connect(thread.quit)
 
@@ -1334,3 +1662,19 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
