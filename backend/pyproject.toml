@@ -3,9 +3,9 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "studyglance-backend"
+name = "overlayai-backend"
 version = "0.1.0"
-description = "StudyGlance backend API"
+description = "OverlayAI backend API"
 requires-python = ">=3.10"
 dependencies = []
 
