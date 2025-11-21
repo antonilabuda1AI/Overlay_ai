@@ -1,5 +1,5 @@
 ﻿
-OverlayAI â€” Usage Guide
+OverlayAI — Usage Guide
 =========================
 
 Prerequisites
@@ -36,4 +36,5 @@ HOW TO RUN (DEV)
 - `cd backend && uvicorn app.main:app --reload`
 - `cd apps/overlay/pyqt && python main.py`
 - `cd web/site && npm install && npm run dev`
+
 
