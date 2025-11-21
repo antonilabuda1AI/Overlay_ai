@@ -1,4 +1,4 @@
-﻿# StudyGlance / Overlay AI
+# OverlayAI
 
 ## Overview
 A PyQt-based on-screen overlay with OCR-powered Q&A assistance. It provides a lightweight UI overlay, hotkeys, and OCR capture to answer questions about on-screen content.
@@ -38,3 +38,4 @@ Auto-generated short file tree summary:
 |-- web\/
     |-- site\/
 ```
+
