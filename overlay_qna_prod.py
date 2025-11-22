@@ -786,6 +786,7 @@ class HistoryWindow(QtWidgets.QWidget):
             else:
                 lines = b.split('\n')
                 ul = False
+                ol = False
                 for line in lines:
                     ls = line.strip()
                     if ls.startswith(('#','##','###')):
@@ -794,18 +795,48 @@ class HistoryWindow(QtWidgets.QWidget):
                         size = 16 if lvl==1 else 14 if lvl==2 else 13
                         out.append(f"<div style=\"font-weight:600;font-size:{size}px;margin:6px 0;\">{txt}</div>")
                     elif ls.startswith(('- ','* ')):
+                        # Close ordered list if switching from ol
+                        if ol:
+                            out.append('</ol>'); ol = False
+                            out.append('<div style="height:6px;"></div>')
                         if not ul:
                             out.append('<ul style="margin:4px 16px;">'); ul = True
                         out.append(f"<li style=\"margin:2px 0;\">{esc(ls[2:])}</li>")
+                    elif re.match(r'^\d+\.\s+', ls or ''):
+                        # Ordered list item
+                        if ul:
+                            out.append('</ul>'); ul = False
+                            out.append('<div style="height:6px;"></div>')
+                        if not ol:
+                            out.append('<ol style="margin:4px 16px;">'); ol = True
+                        # Extract the text after the leading number and dot
+                        m = re.match(r'^(\d+)\.\s+(.*)$', ls)
+                        item_txt = esc(m.group(2) if m else ls)
+                        out.append(f"<li style=\"margin:2px 0;\">{item_txt}</li>")
                     else:
+                        # Close any open list blocks when the pattern breaks
                         if ul:
                             out.append('</ul>'); ul=False
+                            out.append('<div style="height:6px;"></div>')
+                        if ol:
+                            out.append('</ol>'); ol=False
+                            out.append('<div style="height:6px;"></div>')
+                        # Bold equations like "A = B", "Profit = TR - TC"
+                        if ls and re.match(r'^[A-Za-z][A-Za-z0-9_\s]*=\s*.+', ls):
+                            out.append(f"<div style='margin:4px 0;'><b>{esc(ls)}</b></div>")
+                            out.append('<div style="height:6px;"></div>')
+                            continue
                         if ls:
                             out.append(f"<div style=\"line-height:1.35;\">{esc(line)}</div>")
                         else:
                             out.append('<div style="height:6px;"></div>')
+                # Close any lists still open at the end of the block and add spacing
                 if ul:
-                    out.append('</ul>')
+                    out.append('</ul>'); ul=False
+                    out.append('<div style="height:6px;"></div>')
+                if ol:
+                    out.append('</ol>'); ol=False
+                    out.append('<div style="height:6px;"></div>')
         return "\n".join(out)
 
     def _max_bubble_width(self) -> int:
